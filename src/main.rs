@@ -38,7 +38,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// does testing things
-    Scan,
+    Scan {
+        /// optimize automatically using 'pdfsizeopt' utility
+        #[arg(short, long)]
+        optimize: bool,
+    },
 }
 
 fn now() -> chrono::DateTime<Tz> {
@@ -291,7 +295,7 @@ async fn main() -> Result<()> {
     let batch_prefix = format!("{now}---");
 
     match command {
-        Commands::Scan => {
+        Commands::Scan { optimize } => {
             let devices = list_devices().await?;
             let device = inquire::Select::new("which scanner?", devices)
                 .prompt()
@@ -309,20 +313,20 @@ async fn main() -> Result<()> {
             };
             let first_batch = perform_scan(batch_prefix.clone(), device.clone()).await?;
 
-            let all_pages =
-                match inquire::Confirm::new("wanna flip the sides and do the double sided scan?")
+            let all_pages = match optimize
+                || inquire::Confirm::new("wanna flip the sides and do the double sided scan?")
                     .prompt()
                     .wrap_err("oops")?
-                {
-                    true => {
-                        let second_batch = perform_scan(batch_prefix.clone(), device).await?;
-                        first_batch
-                            .into_iter()
-                            .interleave(second_batch.into_iter().rev())
-                            .collect_vec()
-                    }
-                    false => first_batch,
-                };
+            {
+                true => {
+                    let second_batch = perform_scan(batch_prefix.clone(), device).await?;
+                    first_batch
+                        .into_iter()
+                        .interleave(second_batch.into_iter().rev())
+                        .collect_vec()
+                }
+                false => first_batch,
+            };
             if all_pages.is_empty() {
                 bail!("something went wrong, there should be at least one image here...");
             }
@@ -367,6 +371,29 @@ async fn main() -> Result<()> {
                 .wrap_err("merging went wrong")?
                 .exit_ok()
                 .wrap_err("something went wrong...")?;
+            match inquire::Confirm::new("wanna optimize the scanned images?")
+                .prompt()
+                .wrap_err("oops")?
+            {
+                true => {
+                    // pdfsizeopt --do-require-image-optimizers=no ./wypowiedzenie-umowy-wojciech-brozek-maria-piatek.pdf ./wypowiedzenie-umowy-wojciech-brozek-maria-piatek.pdf
+                    tokio::process::Command::new("pdfsizeopt")
+                        .arg("--do-require-image-optimizers=no")
+                        .arg(&path)
+                        .arg(&path)
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .debug()
+                        .spawn()
+                        .wrap_err("spawning optimizer command")?
+                        .wait()
+                        .await
+                        .wrap_err("optimizing went wrong")?
+                        .exit_ok()
+                        .wrap_err("bad status code")?;
+                }
+                false => {}
+            }
 
             info!("everything is done");
 
