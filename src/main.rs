@@ -15,6 +15,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio_retry::strategy::FixedInterval;
 use tokio_retry::Retry;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::Instrument;
 #[allow(unused_imports)]
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn};
 
@@ -140,6 +141,7 @@ pub enum MessageReceived {
     ProcessExitedSuccess,
 }
 
+#[instrument(err)]
 async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(String, Vec<u8>)>> {
     let mut command = base();
     command
@@ -170,46 +172,59 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
 
     if let Some(stdout) = child.stdout.take() {
         let tx = tx.clone();
-        tokio::task::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stdout).lines();
-            while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                debug!(stdout=%line);
-                send_lines(&tx, &line).expect("sending lines");
+        tokio::task::spawn(
+            async move {
+                let mut reader = tokio::io::BufReader::new(stdout).lines();
+                while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
+                    debug!(stdout=%line);
+                    send_lines(&tx, &line).expect("sending lines");
+                }
             }
-        });
+            .instrument(info_span!("stdout").or_current()),
+        );
     }
 
     if let Some(stderr) = child.stderr.take() {
         let tx = tx.clone();
-        tokio::task::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr).lines();
-            while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                debug!(stderr=%line);
-                send_lines(&tx, &line).expect("sending lines");
+        tokio::task::spawn(
+            async move {
+                let mut reader = tokio::io::BufReader::new(stderr).lines();
+                while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
+                    info!(stderr=%line);
+                    send_lines(&tx, &line).expect("sending lines");
+                }
             }
-        });
+            .instrument(info_span!("stderr").or_current()),
+        );
     }
 
-    tokio::task::spawn(async move {
-        match child
-            .wait()
-            .await
-            .wrap_err("running the scanner command resulted in a failure")
-            .and_then(|status| status.exit_ok().wrap_err("scanning returned an error"))
-        {
-            Ok(_) => {
-                debug!("scanning process exited");
-                tx.send(MessageReceived::ProcessExitedSuccess).unwrap();
-                // tx.closed().await;
+    tokio::task::spawn(
+        async move {
+            match child
+                .wait()
+                .await
+                .wrap_err("running the scanner command resulted in a failure")
+                .and_then(|status| {
+                    tracing::info!(?status, "finished");
+                    status.exit_ok().wrap_err("scanning returned an error")
+                }) {
+                Ok(_) => {
+                    warn!("scanning process exited");
+                    tx.send(MessageReceived::ProcessExitedSuccess).unwrap();
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "something went wrong with the scan, retry?");
+                    tx.send(MessageReceived::ProcessExitedWithAnError(error))
+                        .expect("memory problem? thread crashed?")
+                }
             }
-            Err(error) => tx
-                .send(MessageReceived::ProcessExitedWithAnError(error))
-                .expect("memory problem? thread crashed?"),
         }
-    });
+        .instrument(tracing::info_span!("actual scan command").or_current()),
+    );
     UnboundedReceiverStream::new(rx)
-        .filter_map(|line| async move {
-            match line {
+        .filter_map(|message| async move {
+            tracing::debug!(?message, "message received");
+            match message {
                 MessageReceived::Line(line) => {
                     debug!(line=?line);
                     match extract_print_progress(&line) {
@@ -218,7 +233,7 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
                             None
                         }
                         Ok(l) => {
-                            info!(line=%l, "scanning successful");
+                            info!(line=%l, "scanning a page successful");
                             Some(Ok(l))
                         }
                     }
@@ -302,7 +317,7 @@ async fn main() -> Result<()> {
                 .wrap_err("select a proper option")?;
             info!("collecting first batch");
             let perform_scan = move |batch_prefix: String, device: Device| {
-                let retry_strategy = FixedInterval::from_millis(2000).take(10); // limit to 3 retries
+                let retry_strategy = FixedInterval::from_millis(5000).take(3); // limit to 3 retries
                 let batch_prefix = batch_prefix.clone();
                 let device = device.clone();
                 Retry::spawn(retry_strategy, move || {
@@ -313,20 +328,20 @@ async fn main() -> Result<()> {
             };
             let first_batch = perform_scan(batch_prefix.clone(), device.clone()).await?;
 
-            let all_pages = match optimize
-                || inquire::Confirm::new("wanna flip the sides and do the double sided scan?")
+            let all_pages =
+                match inquire::Confirm::new("wanna flip the sides and do the double sided scan?")
                     .prompt()
                     .wrap_err("oops")?
-            {
-                true => {
-                    let second_batch = perform_scan(batch_prefix.clone(), device).await?;
-                    first_batch
-                        .into_iter()
-                        .interleave(second_batch.into_iter().rev())
-                        .collect_vec()
-                }
-                false => first_batch,
-            };
+                {
+                    true => {
+                        let second_batch = perform_scan(batch_prefix.clone(), device).await?;
+                        first_batch
+                            .into_iter()
+                            .interleave(second_batch.into_iter().rev())
+                            .collect_vec()
+                    }
+                    false => first_batch,
+                };
             if all_pages.is_empty() {
                 bail!("something went wrong, there should be at least one image here...");
             }
@@ -371,9 +386,10 @@ async fn main() -> Result<()> {
                 .wrap_err("merging went wrong")?
                 .exit_ok()
                 .wrap_err("something went wrong...")?;
-            match inquire::Confirm::new("wanna optimize the scanned images?")
-                .prompt()
-                .wrap_err("oops")?
+            match optimize
+                || inquire::Confirm::new("wanna optimize the scanned images?")
+                    .prompt()
+                    .wrap_err("oops")?
             {
                 true => {
                     // pdfsizeopt --do-require-image-optimizers=no ./wypowiedzenie-umowy-wojciech-brozek-maria-piatek.pdf ./wypowiedzenie-umowy-wojciech-brozek-maria-piatek.pdf
