@@ -14,6 +14,7 @@ use std::{fmt::Display, path::PathBuf, process::Stdio};
 use tokio::io::AsyncBufReadExt;
 use tokio_retry::strategy::FixedInterval;
 use tokio_retry::Retry;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 #[allow(unused_imports)]
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn};
 
@@ -162,30 +163,29 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
                 .map(|_| ())
         }
     };
-    {
-        if let Some(stdout) = child.stdout.take() {
-            let tx = tx.clone();
-            tokio::task::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(stdout).lines();
-                while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                    debug!(stdout=%line);
-                    send_lines(&tx, &line).expect("sending lines");
-                }
-            });
-        }
+
+    if let Some(stdout) = child.stdout.take() {
+        let tx = tx.clone();
+        tokio::task::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
+                debug!(stdout=%line);
+                send_lines(&tx, &line).expect("sending lines");
+            }
+        });
     }
-    {
-        if let Some(stderr) = child.stderr.take() {
-            let tx = tx.clone();
-            tokio::task::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(stderr).lines();
-                while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                    debug!(stderr=%line);
-                    send_lines(&tx, &line).expect("sending lines");
-                }
-            });
-        }
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx = tx.clone();
+        tokio::task::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr).lines();
+            while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
+                debug!(stderr=%line);
+                send_lines(&tx, &line).expect("sending lines");
+            }
+        });
     }
+
     tokio::task::spawn(async move {
         match child
             .wait()
@@ -203,7 +203,7 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
                 .expect("memory problem? thread crashed?"),
         }
     });
-    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+    UnboundedReceiverStream::new(rx)
         .filter_map(|line| async move {
             match line {
                 MessageReceived::Line(line) => {
@@ -234,10 +234,23 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
         .await
 }
 
+fn setup_logging() {
+    use tracing_subscriber::prelude::*;
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or(tracing_subscriber::EnvFilter::try_from("info").unwrap()),
+        )
+        .with(tracing_subscriber::fmt::Layer::new().with_writer(std::io::stderr));
+    if let Err(message) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("logging setup failed: {message:?}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install().ok();
-    tracing_subscriber::fmt::init();
+    setup_logging();
     let Cli { command } = Cli::parse();
     let now = now().format("%Y-%m-%d--%H-%M-%S");
     debug!("debug log enabled");
@@ -336,6 +349,7 @@ async fn main() -> Result<()> {
                 inquire::Text::new("how would you like to name your file (without extension)")
                     .prompt()?;
             let path = PathBuf::from(filename).with_extension("pdf");
+
             filenames
                 .into_iter()
                 .fold(tokio::process::Command::new("convert"), |mut acc, next| {
@@ -353,8 +367,9 @@ async fn main() -> Result<()> {
                 .wrap_err("merging went wrong")?
                 .exit_ok()
                 .wrap_err("something went wrong...")?;
+
             info!("everything is done");
-            println!();
+
             println!("{}", path.to_string_lossy());
             Ok(())
         }
