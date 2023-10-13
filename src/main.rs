@@ -12,6 +12,8 @@ use itertools::Itertools;
 use std::path::Path;
 use std::{fmt::Display, path::PathBuf, process::Stdio};
 use tokio::io::AsyncBufReadExt;
+use tokio_retry::strategy::FixedInterval;
+use tokio_retry::Retry;
 #[allow(unused_imports)]
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn};
 
@@ -53,7 +55,7 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Device {
     id: String,
     description: String,
@@ -132,7 +134,8 @@ pub enum MessageReceived {
     ProcessExitedWithAnError(eyre::Report),
     ProcessExitedSuccess,
 }
-async fn perform_scan(batch_prefix: String, device: &Device) -> Result<Vec<(String, Vec<u8>)>> {
+
+async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(String, Vec<u8>)>> {
     let mut command = base();
     command
         .args(["-d", device.id.to_string().as_str()])
@@ -165,7 +168,6 @@ async fn perform_scan(batch_prefix: String, device: &Device) -> Result<Vec<(Stri
             tokio::task::spawn(async move {
                 let mut reader = tokio::io::BufReader::new(stdout).lines();
                 while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                    let send_lines = send_lines.clone();
                     debug!(stdout=%line);
                     send_lines(&tx, &line).expect("sending lines");
                 }
@@ -178,7 +180,6 @@ async fn perform_scan(batch_prefix: String, device: &Device) -> Result<Vec<(Stri
             tokio::task::spawn(async move {
                 let mut reader = tokio::io::BufReader::new(stderr).lines();
                 while let Some(line) = reader.next_line().await.ok().and_then(|o| o) {
-                    let send_lines = send_lines.clone();
                     debug!(stderr=%line);
                     send_lines(&tx, &line).expect("sending lines");
                 }
@@ -283,7 +284,17 @@ async fn main() -> Result<()> {
                 .prompt()
                 .wrap_err("select a proper option")?;
             info!("collecting first batch");
-            let first_batch = perform_scan(batch_prefix.clone(), &device).await?;
+            let perform_scan = move |batch_prefix: String, device: Device| {
+                let retry_strategy = FixedInterval::from_millis(2000).take(10); // limit to 3 retries
+                let batch_prefix = batch_prefix.clone();
+                let device = device.clone();
+                Retry::spawn(retry_strategy, move || {
+                    let batch_prefix = batch_prefix.clone();
+                    let device = device.clone();
+                    perform_scan(batch_prefix, device)
+                })
+            };
+            let first_batch = perform_scan(batch_prefix.clone(), device.clone()).await?;
 
             let all_pages =
                 match inquire::Confirm::new("wanna flip the sides and do the double sided scan?")
@@ -291,7 +302,7 @@ async fn main() -> Result<()> {
                     .wrap_err("oops")?
                 {
                     true => {
-                        let second_batch = perform_scan(batch_prefix.clone(), &device).await?;
+                        let second_batch = perform_scan(batch_prefix.clone(), device).await?;
                         first_batch
                             .into_iter()
                             .interleave(second_batch.into_iter().rev())
