@@ -36,6 +36,22 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default)]
+enum ScanSource {
+    #[default]
+    Tray,
+    Flatbed,
+}
+
+impl ScanSource {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            ScanSource::Tray => "ADF",
+            ScanSource::Flatbed => "Flatbed",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// does testing things
@@ -43,6 +59,9 @@ enum Commands {
         /// optimize automatically using 'pdfsizeopt' utility
         #[arg(short, long)]
         optimize: bool,
+        /// scan source
+        #[arg(short, long)]
+        scan_source: ScanSource,
     },
 }
 
@@ -142,7 +161,11 @@ pub enum MessageReceived {
 }
 
 #[instrument(err)]
-async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(String, Vec<u8>)>> {
+async fn perform_scan(
+    batch_prefix: String,
+    device: Device,
+    scan_source: ScanSource,
+) -> Result<Vec<(String, Vec<u8>)>> {
     let mut command = base();
     command
         .args(["-d", device.id.to_string().as_str()])
@@ -150,7 +173,7 @@ async fn perform_scan(batch_prefix: String, device: Device) -> Result<Vec<(Strin
         .args([&format!("--batch={batch_prefix}p%04d.tiff")])
         .args(["--resolution", "300"])
         .args(["--progress"])
-        .args(["--source", "ADF"])
+        .args(["--source", scan_source.as_arg()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .debug();
@@ -310,7 +333,10 @@ async fn main() -> Result<()> {
     let batch_prefix = format!("{now}---");
 
     match command {
-        Commands::Scan { optimize } => {
+        Commands::Scan {
+            optimize,
+            scan_source,
+        } => {
             let devices = list_devices().await?;
             let device = inquire::Select::new("which scanner?", devices)
                 .prompt()
@@ -323,7 +349,7 @@ async fn main() -> Result<()> {
                 Retry::spawn(retry_strategy, move || {
                     let batch_prefix = batch_prefix.clone();
                     let device = device.clone();
-                    perform_scan(batch_prefix, device)
+                    perform_scan(batch_prefix, device, scan_source)
                 })
             };
             let first_batch = perform_scan(batch_prefix.clone(), device.clone()).await?;
