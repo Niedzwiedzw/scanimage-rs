@@ -175,8 +175,11 @@ async fn perform_scan(
         .args(["--progress"])
         .args(["--source", scan_source.as_arg()])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .debug();
+        .stderr(Stdio::piped());
+    if let ScanSource::Flatbed = scan_source {
+        command.args(&["--batch-count=1"]);
+    }
+    command.debug();
     let mut child = command.spawn().wrap_err("running the scan routine")?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MessageReceived>();
     let send_lines = {
